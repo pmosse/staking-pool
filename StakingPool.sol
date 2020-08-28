@@ -332,6 +332,13 @@ contract StakingPool is Ownable {
         rois[_year][_month].roi6 = _roi6;
     }
     
+    function _setDefaultRoi(uint256 _roi1, uint256 _roi2, uint256 _roi3, uint256 _roi6) public onlyOwner {
+        DEFAULT_ROI1 = _roi1;
+        DEFAULT_ROI2 = _roi2;
+        DEFAULT_ROI3 = _roi3;
+        DEFAULT_ROI6 = _roi6;
+    }
+    
     function getRoi(uint256 month, uint256 year, uint8 lockupPeriod) public view returns (uint256) {
         if (rois[year][month].exists) {
             if (lockupPeriod == 1) {

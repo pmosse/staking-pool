@@ -399,8 +399,8 @@ contract StakingPool is Ownable {
         });
                                     
         stakes[msg.sender] = stake;
-        totalStakes += 1;
-        totalStaked += _amount;
+        totalStakes = totalStakes.add(1);
+        totalStaked = totalStaked.add(_amount);
         
         emit NewStake(msg.sender, _amount, _lockupPeriod, _compound, _referrer);
     }
@@ -443,8 +443,8 @@ contract StakingPool is Ownable {
         //10% of the fees are for the Admin. The rest stays in the contract
         adminCanWithdraw = adminCanWithdraw.add(totalToDeduct.div(10));
         
-        totalStakes -= 1;
-        totalStaked -= stake.initialAmount;
+        totalStakes = totalStakes.sub(1);
+        totalStaked = totalStaked.sub(stake.initialAmount);
         delete stakes[msg.sender];
 
         total = total.sub(totalToDeduct);
@@ -592,7 +592,7 @@ contract StakingPool is Ownable {
 
             //This is the month it finishes
             if (currentMonth == finishes.month) {
-                uint8 upToDay = getMin(finishes.day, today.day);
+                uint8 upToDay = _getMin(finishes.day, today.day);
                 total += calcPartialRewardsForMonth(stake.initialAmount, upToDay, roi, false);
                 break;
             }

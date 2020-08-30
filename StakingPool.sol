@@ -321,10 +321,6 @@ contract StakingPool is Ownable {
         token = _token;
     }
     
-    function TESTONLYCHANGECREATEDON(address owner, uint256 createdOn) public {
-        stakes[owner].createdOn = createdOn;
-    }
-    
     function createStake(uint256 _amount, uint8 _lockupPeriod, bool _compound, address _referrer) public {
         require(!stakes[msg.sender].exists, "You already have a stake");
         require(_isValidLockupPeriod(_lockupPeriod), "Invalid lockup period");

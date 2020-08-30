@@ -277,12 +277,12 @@ contract StakingPool is Ownable {
     using SafeMath for uint256;
 
     IERC20 token;
-    uint256 decimals;
-    
+    uint256 decimals = 18;
     uint256 minimumStakeAmount = 1000;
     uint256 public totalStakes = 0;
     uint256 public totalStaked = 0;
     uint256 public adminCanWithdraw = 0;
+    address ZERO_ADDRESS = 0x0000000000000000000000000000000000000000;
 
     struct Stake {
         bool exists;
@@ -316,8 +316,369 @@ contract StakingPool is Ownable {
     event StakeIncreasedForReferral(address indexed staker, uint256 initialAmount, uint256 delta);
     event RewardsWithdrawn(address indexed staker, uint256 total);
     event StakeFinished(address indexed staker, uint256 totalReturned, uint256 fees);
+    
+    constructor(IERC20 _token) public {
+        token = _token;
+    }
+    
+    function TESTONLYCHANGECREATEDON(address owner, uint256 createdOn) public {
+        stakes[owner].createdOn = createdOn;
+    }
+    
+    function createStake(uint256 _amount, uint8 _lockupPeriod, bool _compound, address _referrer) public {
+        require(!stakes[msg.sender].exists, "You already have a stake");
+        require(_isValidLockupPeriod(_lockupPeriod), "Invalid lockup period");
+        require(_amount >= getMinimumStakeAmount(), "Invalid minimum");
+        
+        require(IERC20(token).transferFrom(msg.sender, address(this), calculateTotalWithDecimals(_amount)), "Couldn't take the tokens");
+        
+        if (_referrer != address(0) && stakes[_referrer].exists) {
+            uint256 amountToIncrease = stakes[_referrer].initialAmount.mul(1).div(100);
+            emit StakeIncreasedForReferral(_referrer, stakes[_referrer].initialAmount, amountToIncrease);
+            stakes[_referrer].initialAmount += amountToIncrease;
+            totalStaked = totalStaked.add(amountToIncrease); 
+        }
+        else {
+            _referrer = ZERO_ADDRESS;
+        }
 
-    function _setRoi(uint256 _month, uint256 _year, uint256 _roi1, uint256 _roi2, uint256 _roi3, uint256 _roi6) public onlyOwner {
+        Stake memory stake = Stake({exists:true,
+                                    createdOn: now, 
+                                    initialAmount:_amount, 
+                                    compound:_compound, 
+                                    lockupPeriod:_lockupPeriod, 
+                                    withdrawn:0,
+                                    referrer:_referrer
+        });
+                                    
+        stakes[msg.sender] = stake;
+        totalStakes = totalStakes.add(1);
+        totalStaked = totalStaked.add(_amount);
+        
+        emit NewStake(msg.sender, _amount, _lockupPeriod, _compound, _referrer);
+    }
+    
+    function finishStake() public {
+        require(stakes[msg.sender].exists, "Invalid stake");
+        
+        Stake memory stake = stakes[msg.sender];
+        
+        uint256 finishesOn = _calculateFinishTimestamp(stake.createdOn, stake.lockupPeriod);
+        
+        uint256 total;
+        uint256 totalToDeduct;
+        uint256 penalty;
+        
+        if (stake.compound) {
+            require(now > finishesOn, "Can't be finished yet");
+            total = getTotalToWidthdrawForCompounders(msg.sender); //This includes the initial amount
+            totalToDeduct = total.mul(2).div(100);
+        }
+        else {
+            if (now > finishesOn) {
+                total = getTotalToWidthdrawForNotCompounders(msg.sender);
+            }
+            else {
+                //As it didn't finish, pay a fee of 5% (before first half) or 2% (after first half)
+                uint8 penaltyPerc = 5;
+                if (_isFirstHalf(stake.createdOn, stake.lockupPeriod)) {
+                    penaltyPerc = 2;
+                }
+                total = getPartialToWidthdrawForNotCompounders(msg.sender, now);
+                penalty = total.mul(penaltyPerc).div(100);
+                total = total.sub(penalty);
+            }
+            total = total.add(stake.initialAmount);
+            totalToDeduct = total.mul(1).div(100);
+        }
+        
+        totalToDeduct = totalToDeduct.add(penalty);
+        //10% of the fees are for the Admin.
+        adminCanWithdraw = adminCanWithdraw.add(totalToDeduct.div(10));
+        //The rest are burnt
+        require(IERC20(token).transferFrom(address(this), ZERO_ADDRESS, calculateTotalWithDecimals(totalToDeduct.mul(9).div(10))), "Couldn't burn the tokens");
+
+        totalStakes = totalStakes.sub(1);
+        totalStaked = totalStaked.sub(stake.initialAmount);
+        delete stakes[msg.sender];
+
+        total = total.sub(totalToDeduct);
+        require(token.transfer(msg.sender, calculateTotalWithDecimals(total)));
+        
+        emit StakeFinished(msg.sender, total, totalToDeduct);
+    }
+    
+    function calculateTotalWithDecimals(uint256 _amount) internal view returns (uint256) {
+        return _amount * 10 ** decimals;
+    }
+    
+    function _isFirstHalf(uint256 _createdOn, uint8 _lockupPeriod) internal view returns (bool) {
+        uint256 day = 60 * 60 * 24;
+        
+        if (_lockupPeriod == 1) {
+            return _createdOn + day.mul(15) > now;
+        }
+        if (_lockupPeriod == 2) {
+            return _createdOn + day.mul(30) > now;
+        }
+        if (_lockupPeriod == 3) {
+            return _createdOn + day.mul(45) > now;
+        }
+        return _createdOn + day.mul(90) > now;
+    }
+    
+    function withdraw() public {
+        require(stakes[msg.sender].exists, "Invalid stake");
+        require(!stakes[msg.sender].compound, "Compounders can't withdraw before they finish their stake");
+
+        Stake storage stake = stakes[msg.sender];
+        uint256 total = getPartialToWidthdrawForNotCompounders(msg.sender, now);
+        stake.withdrawn += total;
+        
+        require(token.transfer(msg.sender, calculateTotalWithDecimals(total)));
+
+        emit RewardsWithdrawn(msg.sender, total);
+    }
+    
+    function calcPartialRewardsForInitialMonth(Stake memory stake, uint8 _todayDay, Date._Date memory _initial, bool compounding) internal view returns (uint256) {
+        uint256 roi = getRoi(_initial.month, _initial.year, stake.lockupPeriod);
+        uint8 totalDays = _todayDay - _initial.day;
+        return calculateRewards(stake.initialAmount, totalDays, roi, compounding);
+    }
+
+    function calcFullRewardsForInitialMonth(Stake memory stake, Date._Date memory _initial, bool compounding) internal view returns (uint256) {
+        uint8 totalDays = Date.getDaysInMonth(_initial.month, _initial.year);
+        uint256 roi = getRoi(_initial.month, _initial.year, stake.lockupPeriod);
+        uint8 countDays = totalDays - _initial.day;
+        return calculateRewards(stake.initialAmount, countDays, roi, compounding);
+    }
+    
+    function calcFullRewardsForMonth(uint256 _currentTotal, uint256 _roi, uint16 _year, uint8 _month, bool compounding) internal pure returns (uint256) {
+        uint256 totalDays = Date.getDaysInMonth(_month, _year);
+        return calculateRewards(_currentTotal, totalDays, _roi, compounding);
+    }
+    
+    function calculateRewards(uint256 currentTotal, uint256 totalDays, uint256 roi, bool compounding) internal pure returns (uint256) {
+        if (compounding) {
+            while(totalDays > 10) {
+                currentTotal = currentTotal * (roi.add(1000)) ** 10 / 1000 ** 10;
+                totalDays -= 10;
+            }
+            return currentTotal * (roi.add(1000)) ** totalDays / 1000 ** totalDays;
+        }
+        
+        //Not compounding
+        return currentTotal.mul(totalDays).mul(roi).div(1000);
+    }
+    
+    //This function is meant to be called internally when finishing your stake
+    function getTotalToWidthdrawForNotCompounders(address _account) internal view returns (uint256) {
+        Stake memory stake = stakes[_account];
+        
+        Date._Date memory initial = Date.parseTimestamp(stake.createdOn);
+        
+        uint256 total = calcFullRewardsForInitialMonth(stake, initial, false);
+        
+        uint256 finishTimestamp = _calculateFinishTimestamp(stake.createdOn, stake.lockupPeriod);
+        Date._Date memory finishes = Date.parseTimestamp(finishTimestamp);
+        
+        for(uint8 i=1;i<=stake.lockupPeriod;i++) {
+            uint8 currentMonth = initial.month + i;
+            uint16 currentYear = initial.year;
+            if (currentMonth > 12) {
+                currentYear += 1;
+                currentMonth = currentMonth % 12;
+            }
+
+            uint256 roi = getRoi(currentMonth, currentYear ,stake.lockupPeriod);
+
+            //This is the month it finishes on
+            if (currentMonth == finishes.month) {
+                //Calculates partial rewards for month
+                total += calculateRewards(stake.initialAmount, finishes.day, roi, false);
+                break;
+            }
+            
+            //This is a complete month I need to add
+            total += calcFullRewardsForMonth(stake.initialAmount, roi, currentYear, currentMonth, false);
+        }
+        
+        total = total.sub(stake.withdrawn);
+        return total;
+    }
+    
+    //This function is meant to be called internally when withdrawing as much as you can, or by the UI
+    function getPartialToWidthdrawForNotCompounders(address _account, uint256 _now) public view returns (uint256) {
+        Stake memory stake = stakes[_account];
+        
+        Date._Date memory initial = Date.parseTimestamp(stake.createdOn);
+        Date._Date memory today = Date.parseTimestamp(_now);
+        
+        //I am still in my first month of staking
+        if (initial.month == today.month) {
+            uint256 total = calcPartialRewardsForInitialMonth(stake, today.day, initial, false);
+            total = total.sub(stake.withdrawn);
+            return total;
+        }
+        
+        //I am in a month after my first month of staking
+        uint256 total = calcFullRewardsForInitialMonth(stake, initial, false);
+        
+        uint256 finishTimestamp = _calculateFinishTimestamp(stake.createdOn, stake.lockupPeriod);
+        Date._Date memory finishes = Date.parseTimestamp(finishTimestamp);
+        
+        for(uint8 i=1;i<=stake.lockupPeriod;i++) {
+            uint8 currentMonth = initial.month + i;
+            uint16 currentYear = initial.year;
+            if (currentMonth > 12) {
+                currentYear += 1;
+                currentMonth = currentMonth % 12;
+            }
+
+            uint256 roi = getRoi(currentMonth, currentYear, stake.lockupPeriod);
+
+            //This is the month it finishes
+            if (currentMonth == finishes.month) {
+                uint8 upToDay = _getMin(finishes.day, today.day);
+                //Calculates partial rewards for month
+                total += calculateRewards(stake.initialAmount, upToDay, roi, false);
+                break;
+            }
+            else if (currentMonth == today.month) { // We reached the current month
+                //Calculates partial rewards for month
+                total += calculateRewards(stake.initialAmount, today.day, roi, false);
+                break;
+            }
+            
+            //This is a complete month I need to add
+            total += calcFullRewardsForMonth(stake.initialAmount, roi, currentYear, currentMonth, false);
+        }
+        
+        total = total.sub(stake.withdrawn);
+        return total;
+    }
+    
+    //This function is meant to be called internally on finishing your stake
+    function getTotalToWidthdrawForCompounders(address _account) internal view returns (uint256) {
+        Stake memory stake = stakes[_account];
+        
+        Date._Date memory initial = Date.parseTimestamp(stake.createdOn);
+        
+        uint256 total = calcFullRewardsForInitialMonth(stake, initial, true);
+        
+        uint256 finishTimestamp = _calculateFinishTimestamp(stake.createdOn, stake.lockupPeriod);
+        Date._Date memory finishes = Date.parseTimestamp(finishTimestamp);
+        
+        for(uint8 i=1;i<=stake.lockupPeriod;i++) {
+            uint8 currentMonth = initial.month + i;
+            uint16 currentYear = initial.year;
+            if (currentMonth > 12) {
+                currentYear += 1;
+                currentMonth = currentMonth % 12;
+            }
+
+            uint256 roi = getRoi(currentMonth, currentYear, stake.lockupPeriod);
+
+            //This is the month it finishes on
+            if (currentMonth == finishes.month) {
+                //Calculates partial rewards for month
+                return calculateRewards(total, finishes.day, roi, true);
+            }
+            
+            //This is a complete month I need to add
+            total = calcFullRewardsForMonth(total, roi, currentYear, currentMonth, true);
+        }
+    }
+    
+    //This function is meant to be called from the UI
+    function getPartialRewardsForCompounders(address _account, uint256 _now) public view returns (uint256) {
+        Stake memory stake = stakes[_account];
+        
+        Date._Date memory initial = Date.parseTimestamp(stake.createdOn);
+        Date._Date memory today = Date.parseTimestamp(_now);
+        
+        //I am still in my first month of staking
+        if (initial.month == today.month) {
+            uint256 total = calcPartialRewardsForInitialMonth(stake, today.day, initial, true);
+            total = total.sub(stake.withdrawn);
+            return total;
+        }
+        
+        //I am in a month after my first month of staking
+        uint256 total = calcFullRewardsForInitialMonth(stake, initial, true);
+        
+        uint256 finishTimestamp = _calculateFinishTimestamp(stake.createdOn, stake.lockupPeriod);
+        Date._Date memory finishes = Date.parseTimestamp(finishTimestamp);
+        
+        for(uint8 i=1;i<=stake.lockupPeriod;i++) {
+            uint8 currentMonth = initial.month + i;
+            uint16 currentYear = initial.year;
+            if (currentMonth > 12) {
+                currentYear += 1;
+                currentMonth = currentMonth % 12;
+            }
+
+            uint256 roi = getRoi(currentMonth, currentYear, stake.lockupPeriod);
+
+            //This is the month it finishes
+            if (currentMonth == finishes.month) {
+                uint8 upToDay = _getMin(finishes.day, today.day);
+                //Calculates partial rewards for month
+                return calculateRewards(total, upToDay, roi, true);
+            }
+            else if (currentMonth == today.month) { // We reached the current month
+                //Calculates partial rewards for month
+                return calculateRewards(total, today.day, roi, true);
+            }
+            
+            //This is a complete month I need to add
+            total = calcFullRewardsForMonth(total, roi, currentYear, currentMonth, true);
+        }
+    }
+    
+    function _getMin(uint8 num1, uint8 num2) internal pure returns (uint8) {
+        if (num1 < num2) {
+            return num1;
+        }
+        
+        return num2;
+    }
+    
+    function _calculateFinishTimestamp(uint256 _timestamp, uint8 _lockupPeriod) public pure returns (uint256) {
+        uint16 year = Date.getYear(_timestamp);
+        uint8 month = Date.getMonth(_timestamp);
+        month += _lockupPeriod;
+        if (month > 12) {
+            year += 1;
+            month = month % 12;
+        }
+        uint8 day = Date.getDay(_timestamp);
+        return Date.toTimestamp(year, month, day);
+    }
+    
+    function _isValidLockupPeriod(uint8 n) internal pure returns (bool) {
+        return n == 1 || n == 2 || n == 3 || n == 6;
+    }
+
+    function _adminWithdraw() public onlyOwner {
+        uint256 amount = adminCanWithdraw;
+        adminCanWithdraw = 0;
+        require(token.transfer(msg.sender, calculateTotalWithDecimals(amount)));
+    }
+
+    function _extractDESTSentByMistake(uint256 amount, address _sendTo) public onlyOwner {
+        require(token.transfer(_sendTo, amount));
+    }
+    
+    function _setMinimumStakeAmount(uint256 _minimumStakeAmount) public onlyOwner {
+        minimumStakeAmount = _minimumStakeAmount;
+    }
+
+    function getMinimumStakeAmount() public view returns (uint256) {
+        return minimumStakeAmount;
+    }
+    
+        function _setRoi(uint256 _month, uint256 _year, uint256 _roi1, uint256 _roi2, uint256 _roi3, uint256 _roi6) public onlyOwner {
         require(!rois[_year][_month].exists, "Roi already set");
         
         uint256 today_year = Date.getYear(now);
@@ -369,359 +730,5 @@ contract StakingPool is Ownable {
         }
         
         return 0;
-    }
-    
-    constructor(IERC20 _token) public {
-        token = _token;
-    }
-
-    function _setMinimumStakeAmount(uint256 _minimumStakeAmount) public onlyOwner {
-        minimumStakeAmount = _minimumStakeAmount;
-    }
-
-    function getMinimumStakeAmount() public view returns (uint256) {
-        return minimumStakeAmount;
-    }
-    
-    function createStake(uint256 _amount, uint8 _lockupPeriod, bool _compound, address _referrer) public {
-        require(!stakes[msg.sender].exists, "You already have a stake");
-        require(_isValidLockupPeriod(_lockupPeriod), "Invalid lockup period");
-        require(_amount >= getMinimumStakeAmount(), "Invalid minimum");
-        require(IERC20(token).transferFrom(msg.sender, address(this), _amount * 10 ** decimals), "Couldn't take the tokens");
-        
-        if (_referrer != address(0) && stakes[_referrer].exists) {
-            uint256 amountToIncrease = stakes[_referrer].initialAmount.mul(1).div(100);
-            emit StakeIncreasedForReferral(_referrer, stakes[_referrer].initialAmount, amountToIncrease);
-            stakes[_referrer].initialAmount += amountToIncrease;
-            totalStaked = totalStaked.add(amountToIncrease); 
-        }
-
-        Stake memory stake = Stake({exists:true,
-                                    createdOn: now, 
-                                    initialAmount:_amount, 
-                                    compound:_compound, 
-                                    lockupPeriod:_lockupPeriod, 
-                                    withdrawn:0,
-                                    referrer:_referrer
-        });
-                                    
-        stakes[msg.sender] = stake;
-        totalStakes = totalStakes.add(1);
-        totalStaked = totalStaked.add(_amount);
-        
-        emit NewStake(msg.sender, _amount, _lockupPeriod, _compound, _referrer);
-    }
-    
-    function finishStake() public {
-        require(stakes[msg.sender].exists, "Invalid stake");
-        
-        Stake memory stake = stakes[msg.sender];
-        
-        uint256 finishesOn = calculateFinishTimestamp(stake.createdOn, stake.lockupPeriod);
-        
-        uint256 total;
-        uint256 totalToDeduct;
-        uint256 penalty;
-        
-        if (stake.compound) {
-            require(now > finishesOn, "Can't be finished yet");
-            total = getTotalToWidthdrawForCompounders(msg.sender); //This includes the initial amount
-            totalToDeduct = total.mul(2).div(100);
-        }
-        else {
-            if (now > finishesOn) {
-                total = getTotalToWidthdrawForNotCompounders(msg.sender);
-            }
-            else {
-                //As it didn't finish, pay a fee of 5% (before first half) or 2% (after first half)
-                uint8 penaltyPerc = 5;
-                if (_isFirstHalf(stake.createdOn, stake.lockupPeriod)) {
-                    penaltyPerc = 2;
-                }
-                total = getPartialToWidthdrawForNotCompounders(msg.sender, now);
-                penalty = total.mul(penaltyPerc).div(100);
-                total = total.sub(penalty);
-            }
-            total = total.add(stake.initialAmount);
-            totalToDeduct = total.mul(1).div(100);
-        }
-        
-        totalToDeduct = totalToDeduct.add(penalty);
-        //10% of the fees are for the Admin. The rest stays in the contract
-        adminCanWithdraw = adminCanWithdraw.add(totalToDeduct.div(10));
-        
-        totalStakes = totalStakes.sub(1);
-        totalStaked = totalStaked.sub(stake.initialAmount);
-        delete stakes[msg.sender];
-
-        total = total.sub(totalToDeduct);
-        require(token.transfer(msg.sender, total * 10 ** decimals));
-        
-        emit StakeFinished(msg.sender, total, totalToDeduct);
-    }
-    
-    function _isFirstHalf(uint256 _createdOn, uint8 _lockupPeriod) internal view returns (bool) {
-        uint256 day = 60 * 60 * 24;
-        
-        if (_lockupPeriod == 1) {
-            return _createdOn + day.mul(15) > now;
-        }
-        if (_lockupPeriod == 2) {
-            return _createdOn + day.mul(30) > now;
-        }
-        if (_lockupPeriod == 3) {
-            return _createdOn + day.mul(45) > now;
-        }
-        return _createdOn + day.mul(90) > now;
-    }
-    
-    function withdraw() public {
-        require(stakes[msg.sender].exists, "Invalid stake");
-        require(!stakes[msg.sender].compound, "Compounders can't withdraw before they finish their stake");
-
-        Stake storage stake = stakes[msg.sender];
-        uint256 total = getPartialToWidthdrawForNotCompounders(msg.sender, now);
-        stake.withdrawn += total;
-        
-        require(token.transfer(msg.sender, total * 10 ** decimals));
-
-        emit RewardsWithdrawn(msg.sender, total);
-    }
-    
-    function calcPartialRewardsForInitialMonth(uint256 _initialAmount, uint8 _lockupPeriod, uint8 _todayDay, uint8 _initialDay, uint8 _initialMonth, uint16 _initialYear, bool compounding) internal view returns (uint256) {
-        uint256 roi = getRoi(_initialMonth, _initialYear, _lockupPeriod);
-        if (compounding) {
-            return calcRewardsForMonthComp(_initialAmount, _todayDay - _initialDay, roi);
-        }
-        return calcRewardsForMonthNotComp(_initialAmount, _todayDay - _initialDay, roi);
-    }
-
-    function calcFullRewardsForInitialMonth(uint256 _initialAmount, uint8 _lockupPeriod, uint8 _initialDay, uint8 _initialMonth, uint16 _initialYear, bool compounding) internal view returns (uint256) {
-        uint256 totalDays = Date.getDaysInMonth(_initialMonth, _initialYear);
-        uint256 roi = getRoi(_initialMonth, _initialYear, _lockupPeriod);
-        if (compounding) {
-            return calcRewardsForMonthComp(_initialAmount, totalDays.sub(_initialDay), roi);
-        }
-        return calcRewardsForMonthNotComp(_initialAmount, totalDays.sub(_initialDay), roi);
-    }
-    
-    function calcPartialRewardsForMonth(uint256 currentTotal, uint256 upToDay, uint256 roi, bool compounding) internal pure returns (uint256) {
-        if (compounding) {
-            return calcRewardsForMonthComp(currentTotal, upToDay, roi);
-        }
-        return calcRewardsForMonthNotComp(currentTotal, upToDay, roi);
-    }
-
-    function calcFullRewardsForMonth(uint256 _currentTotal, uint256 _roi, uint16 _year, uint8 _month, bool compounding) internal pure returns (uint256) {
-        uint256 totalDays = Date.getDaysInMonth(_month, _year);
-        if (compounding) {
-            return calcRewardsForMonthComp(_currentTotal, totalDays, _roi);
-        }
-        return calcRewardsForMonthNotComp(_currentTotal, totalDays, _roi);
-    }
-    
-    function calcRewardsForMonthComp(uint256 currentTotal, uint256 totalDays, uint256 roi) internal pure returns (uint256) {
-        while(totalDays > 10) {
-            currentTotal = currentTotal * (roi.add(1000)) ** 10 / 1000 ** 10;
-            totalDays -= 10;
-        }
-        return currentTotal * (roi.add(1000)) ** totalDays / 1000 ** totalDays;
-    }
-    
-    function calcRewardsForMonthNotComp(uint256 currentTotal, uint256 totalDays, uint256 roi) internal pure returns (uint256) {
-        return currentTotal.mul(totalDays).mul(roi).div(1000);
-    }
-    
-    //This function is meant to be called internally when finishing your stake
-    function getTotalToWidthdrawForNotCompounders(address _account) internal view returns (uint256) {
-        Stake memory stake = stakes[_account];
-        
-        Date._Date memory initial = Date.parseTimestamp(stake.createdOn);
-        
-        uint256 total = calcFullRewardsForInitialMonth(stake.initialAmount, stake.lockupPeriod, initial.day, initial.month, initial.year, false);
-        
-        uint256 finishTimestamp = calculateFinishTimestamp(stake.createdOn, stake.lockupPeriod);
-        Date._Date memory finishes = Date.parseTimestamp(finishTimestamp);
-        
-        for(uint8 i=1;i<=stake.lockupPeriod;i++) {
-            uint8 currentMonth = initial.month + i;
-            uint16 currentYear = initial.year;
-            if (currentMonth > 12) {
-                currentYear += 1;
-                currentMonth = currentMonth % 12;
-            }
-
-            uint256 roi = getRoi(currentMonth, currentYear ,stake.lockupPeriod);
-
-            //This is the month it finishes on
-            if (currentMonth == finishes.month) {
-                total += calcPartialRewardsForMonth(stake.initialAmount, finishes.day, roi, false);
-                break;
-            }
-            
-            //This is a complete month I need to add
-            total += calcFullRewardsForMonth(stake.initialAmount, roi, currentYear, currentMonth, false);
-        }
-        
-        total = total.sub(stake.withdrawn);
-        return total;
-    }
-    
-    //This function is meant to be called internally when withdrawing as much as you can, or by the UI
-    function getPartialToWidthdrawForNotCompounders(address _account, uint256 _now) public view returns (uint256) {
-        Stake memory stake = stakes[_account];
-        
-        Date._Date memory initial = Date.parseTimestamp(stake.createdOn);
-        Date._Date memory today = Date.parseTimestamp(_now);
-        
-        //I am still in my first month of staking
-        if (initial.month == today.month) {
-            uint256 total = calcPartialRewardsForInitialMonth(stake.initialAmount, stake.lockupPeriod, today.day, initial.day, initial.month, initial.year, false);
-            total = total.sub(stake.withdrawn);
-            return total;
-        }
-        
-        //I am in a month after my first month of staking
-        uint256 total = calcFullRewardsForInitialMonth(stake.initialAmount, stake.lockupPeriod, initial.day, initial.month, initial.year, false);
-        
-        uint256 finishTimestamp = calculateFinishTimestamp(stake.createdOn, stake.lockupPeriod);
-        Date._Date memory finishes = Date.parseTimestamp(finishTimestamp);
-        
-        for(uint8 i=1;i<=stake.lockupPeriod;i++) {
-            uint8 currentMonth = initial.month + i;
-            uint16 currentYear = initial.year;
-            if (currentMonth > 12) {
-                currentYear += 1;
-                currentMonth = currentMonth % 12;
-            }
-
-            uint256 roi = getRoi(currentMonth, currentYear, stake.lockupPeriod);
-
-            //This is the month it finishes
-            if (currentMonth == finishes.month) {
-                uint8 upToDay = _getMin(finishes.day, today.day);
-                total += calcPartialRewardsForMonth(stake.initialAmount, upToDay, roi, false);
-                break;
-            }
-            else if (currentMonth == today.month) { // We reached the current month
-                total += calcPartialRewardsForMonth(stake.initialAmount, today.day, roi, false);
-                break;
-            }
-            
-            //This is a complete month I need to add
-            total += calcFullRewardsForMonth(stake.initialAmount, roi, currentYear, currentMonth, false);
-        }
-        
-        total = total.sub(stake.withdrawn);
-        return total;
-    }
-    
-    //This function is meant to be called internal on finishing your stake
-    function getTotalToWidthdrawForCompounders(address _account) internal view returns (uint256) {
-        Stake memory stake = stakes[_account];
-        
-        Date._Date memory initial = Date.parseTimestamp(stake.createdOn);
-        
-        uint256 total = calcFullRewardsForInitialMonth(stake.initialAmount, stake.lockupPeriod, initial.day, initial.month, initial.year, true);
-        
-        uint256 finishTimestamp = calculateFinishTimestamp(stake.createdOn, stake.lockupPeriod);
-        Date._Date memory finishes = Date.parseTimestamp(finishTimestamp);
-        
-        for(uint8 i=1;i<=stake.lockupPeriod;i++) {
-            uint8 currentMonth = initial.month + i;
-            uint16 currentYear = initial.year;
-            if (currentMonth > 12) {
-                currentYear += 1;
-                currentMonth = currentMonth % 12;
-            }
-
-            uint256 roi = getRoi(currentMonth, currentYear, stake.lockupPeriod);
-
-            //This is the month it finishes on
-            if (currentMonth == finishes.month) {
-                return calcPartialRewardsForMonth(total, finishes.day, roi, true);
-            }
-            
-            //This is a complete month I need to add
-            total = calcFullRewardsForMonth(total, roi, currentYear, currentMonth, true);
-        }
-    }
-    
-    //This function is meant to be called from the UI
-    function getPartialRewardsForCompounders(address _account, uint256 _now) public view returns (uint256) {
-        Stake memory stake = stakes[_account];
-        
-        Date._Date memory initial = Date.parseTimestamp(stake.createdOn);
-        Date._Date memory today = Date.parseTimestamp(_now);
-        
-        //I am still in my first month of staking
-        if (initial.month == today.month) {
-            uint256 total = calcPartialRewardsForInitialMonth(stake.initialAmount, stake.lockupPeriod, today.day, initial.day, initial.month, initial.year, true);
-            total = total.sub(stake.withdrawn);
-            return total;
-        }
-        
-        //I am in a month after my first month of staking
-        uint256 total = calcFullRewardsForInitialMonth(stake.initialAmount, stake.lockupPeriod, initial.day, initial.month, initial.year, true);
-        
-        uint256 finishTimestamp = calculateFinishTimestamp(stake.createdOn, stake.lockupPeriod);
-        Date._Date memory finishes = Date.parseTimestamp(finishTimestamp);
-        
-        for(uint8 i=1;i<=stake.lockupPeriod;i++) {
-            uint8 currentMonth = initial.month + i;
-            uint16 currentYear = initial.year;
-            if (currentMonth > 12) {
-                currentYear += 1;
-                currentMonth = currentMonth % 12;
-            }
-
-            uint256 roi = getRoi(currentMonth, currentYear, stake.lockupPeriod);
-
-            //This is the month it finishes
-            if (currentMonth == finishes.month) {
-                uint8 upToDay = _getMin(finishes.day, today.day);
-                return calcPartialRewardsForMonth(total, upToDay, roi, true);
-            }
-            else if (currentMonth == today.month) { // We reached the current month
-                return calcPartialRewardsForMonth(total, today.day, roi, true);
-            }
-            
-            //This is a complete month I need to add
-            total = calcFullRewardsForMonth(total, roi, currentYear, currentMonth, true);
-        }
-    }
-    
-    function _getMin(uint8 num1, uint8 num2) internal pure returns (uint8) {
-        if (num1 < num2) {
-            return num1;
-        }
-        
-        return num2;
-    }
-    
-    function calculateFinishTimestamp(uint256 _timestamp, uint8 _lockupPeriod) public pure returns (uint256) {
-        uint16 year = Date.getYear(_timestamp);
-        uint8 month = Date.getMonth(_timestamp);
-        month += _lockupPeriod;
-        if (month > 12) {
-            year += 1;
-            month = month % 12;
-        }
-        uint8 day = Date.getDay(_timestamp);
-        return Date.toTimestamp(year, month, day);
-    }
-    
-    function _adminWithdraw() public onlyOwner {
-        uint256 amount = adminCanWithdraw;
-        adminCanWithdraw = 0;
-        require(token.transfer(msg.sender, amount * 10 ** decimals));
-    }
-
-    function _extractDESTSentByMistake(uint256 amount, address _sendTo) public onlyOwner {
-        require(token.transfer(_sendTo, amount * 10 ** decimals));
-    }
-
-    function _isValidLockupPeriod(uint8 n) internal pure returns (bool) {
-        return n == 1 || n == 2 || n == 3 || n == 6;
     }
 }

@@ -279,10 +279,13 @@ contract StakingPool is Ownable {
     IERC20 token;
     uint256 decimals = 18;
     uint256 minimumStakeAmount = 1000;
+    address ZERO_ADDRESS = 0x0000000000000000000000000000000000000000;
+    
+    //Stats
     uint256 public totalStakes = 0;
     uint256 public totalStaked = 0;
     uint256 public adminCanWithdraw = 0;
-    address ZERO_ADDRESS = 0x0000000000000000000000000000000000000000;
+    mapping(uint8 => uint256) public totalByLockup;
 
     struct Stake {
         bool exists;
@@ -296,10 +299,15 @@ contract StakingPool is Ownable {
     
     mapping(address => Stake) public stakes;
     
-    uint256 DEFAULT_ROI1 = 2; //0.02% daily ROI
-    uint256 DEFAULT_ROI2 = 3; //0.03% daily ROI
-    uint256 DEFAULT_ROI3 = 4; //0.04% daily ROI
-    uint256 DEFAULT_ROI6 = 5; //0.05% daily ROI
+    uint256 DEFAULT_ROI1 = 7; //0.07% daily ROI
+    uint256 DEFAULT_ROI2 = 14; //0.14% daily ROI
+    uint256 DEFAULT_ROI3 = 19; //0.19% daily ROI
+    uint256 DEFAULT_ROI6 = 25; //0.25% daily ROI
+    
+    bool isValidLockup1 = true;
+    bool isValidLockup2 = false;
+    bool isValidLockup3 = false;
+    bool isValidLockup6 = false;
 
     struct ROI {
         bool exists;
@@ -315,7 +323,8 @@ contract StakingPool is Ownable {
     event NewStake(address indexed staker, uint256 totalStaked, uint8 lockupPeriod, bool compound, address referrer);
     event StakeIncreasedForReferral(address indexed staker, uint256 initialAmount, uint256 delta);
     event RewardsWithdrawn(address indexed staker, uint256 total);
-    event StakeFinished(address indexed staker, uint256 totalReturned, uint256 fees);
+    event StakeFinished(address indexed staker, uint256 totalReturned, uint256 totalDeducted);
+    event TokensBurnt(address indexed staker, uint256 totalBurnt);
     
     constructor(IERC20 _token) public {
         token = _token;
@@ -350,6 +359,7 @@ contract StakingPool is Ownable {
         stakes[msg.sender] = stake;
         totalStakes = totalStakes.add(1);
         totalStaked = totalStaked.add(_amount);
+        totalByLockup[_lockupPeriod] += 1;
         
         emit NewStake(msg.sender, _amount, _lockupPeriod, _compound, _referrer);
     }
@@ -360,48 +370,48 @@ contract StakingPool is Ownable {
         Stake memory stake = stakes[msg.sender];
         
         uint256 finishesOn = _calculateFinishTimestamp(stake.createdOn, stake.lockupPeriod);
+        require(now > finishesOn || !stake.compound, "Can't be finished yet");
         
-        uint256 total;
-        uint256 totalToDeduct;
-        uint256 penalty;
+        uint256 totalRewards;
+        uint256 totalFees;
+        uint256 totalPenalty;
         
         if (stake.compound) {
-            require(now > finishesOn, "Can't be finished yet");
-            total = getTotalToWidthdrawForCompounders(msg.sender); //This includes the initial amount
-            totalToDeduct = total.mul(2).div(100);
+            totalRewards = getTotalToWidthdrawForCompounders(msg.sender); //This includes the initial amount
+            totalRewards = totalRewards.sub(stake.initialAmount);
+            totalFees = totalRewards.mul(5).div(100); //Flat fee of 5%
         }
         else {
             if (now > finishesOn) {
-                total = getTotalToWidthdrawForNotCompounders(msg.sender);
-            }
+                totalRewards = getTotalToWidthdrawForNotCompounders(msg.sender);
+            }  
             else {
-                //As it didn't finish, pay a fee of 5% (before first half) or 2% (after first half)
-                uint8 penaltyPerc = 5;
-                if (_isFirstHalf(stake.createdOn, stake.lockupPeriod)) {
-                    penaltyPerc = 2;
-                }
-                total = getPartialToWidthdrawForNotCompounders(msg.sender, now);
-                penalty = total.mul(penaltyPerc).div(100);
-                total = total.sub(penalty);
+                totalRewards = getPartialToWidthdrawForNotCompounders(msg.sender, now);
+                //As it didn't finish, pay a fee of 10% (before first half) or 5% (after first half)
+                uint8 penalty = _isFirstHalf(stake.createdOn, stake.lockupPeriod) ? 10 : 5;
+                totalPenalty = totalRewards.mul(penalty).div(100);
             }
-            total = total.add(stake.initialAmount);
-            totalToDeduct = total.mul(1).div(100);
+            totalFees = totalRewards.mul(2).div(100); //Flat fee of 2%
         }
         
-        totalToDeduct = totalToDeduct.add(penalty);
+        uint256 totalToDeduct = totalFees.add(totalPenalty);
+        uint256 totalToTransfer = totalRewards.add(stake.initialAmount).sub(totalToDeduct);
+        
         //10% of the fees are for the Admin.
         adminCanWithdraw = adminCanWithdraw.add(totalToDeduct.div(10));
         //The rest are burnt
-        require(IERC20(token).transferFrom(address(this), ZERO_ADDRESS, calculateTotalWithDecimals(totalToDeduct.mul(9).div(10))), "Couldn't burn the tokens");
+        uint256 totalToBurn = totalToDeduct.mul(9).div(10);
+        require(IERC20(token).transferFrom(address(this), ZERO_ADDRESS, calculateTotalWithDecimals(totalToBurn)), "Couldn't burn the tokens");
+        emit TokensBurnt(msg.sender, totalToBurn);
 
         totalStakes = totalStakes.sub(1);
         totalStaked = totalStaked.sub(stake.initialAmount);
+        totalByLockup[stake.lockupPeriod] = totalByLockup[stake.lockupPeriod].sub(1);
         delete stakes[msg.sender];
 
-        total = total.sub(totalToDeduct);
-        require(token.transfer(msg.sender, calculateTotalWithDecimals(total)));
+        require(token.transfer(msg.sender, calculateTotalWithDecimals(totalToTransfer)));
         
-        emit StakeFinished(msg.sender, total, totalToDeduct);
+        emit StakeFinished(msg.sender, totalToTransfer, totalToDeduct);
     }
     
     function calculateTotalWithDecimals(uint256 _amount) internal view returns (uint256) {
@@ -640,7 +650,11 @@ contract StakingPool is Ownable {
         return num2;
     }
     
-    function _calculateFinishTimestamp(uint256 _timestamp, uint8 _lockupPeriod) public pure returns (uint256) {
+    function calculateFinishTimestamp(address account) public view returns (uint256) {
+        return _calculateFinishTimestamp(stakes[account].createdOn, stakes[account].lockupPeriod);
+    }
+    
+    function _calculateFinishTimestamp(uint256 _timestamp, uint8 _lockupPeriod) internal pure returns (uint256) {
         uint16 year = Date.getYear(_timestamp);
         uint8 month = Date.getMonth(_timestamp);
         month += _lockupPeriod;
@@ -652,10 +666,17 @@ contract StakingPool is Ownable {
         return Date.toTimestamp(year, month, day);
     }
     
-    function _isValidLockupPeriod(uint8 n) internal pure returns (bool) {
-        return n == 1 || n == 2 || n == 3 || n == 6;
+    function _isValidLockupPeriod(uint8 n) internal view returns (bool) {
+        return (isValidLockup1 && n == 1) || (isValidLockup2 && n == 2) || (isValidLockup3 && n == 3) || (isValidLockup6 && n == 6);
     }
-
+    
+    function _setValidLockups(bool _isValidLockup1, bool _isValidLockup2, bool _isValidLockup3, bool _isValidLockup6) public onlyOwner {
+        isValidLockup1 = _isValidLockup1;
+        isValidLockup2 = _isValidLockup2;
+        isValidLockup3 = _isValidLockup3;
+        isValidLockup6 = _isValidLockup6;
+    }
+    
     function _adminWithdraw() public onlyOwner {
         uint256 amount = adminCanWithdraw;
         adminCanWithdraw = 0;
